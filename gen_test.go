@@ -5,20 +5,25 @@ import (
 	"testing"
 
 	"golang.org/x/net/html"
-	"golang.org/x/net/html/atom"
 )
 
-var testdiv = `<div class="a">a<div class="b">b1</div><div class="b">b2</div><div class="c">c</div></div>`
+func TestMatchNode(t *testing.T) {
 
-func TestFindChildren(t *testing.T) {
-	n, err := html.Parse(bytes.NewBufferString(testdiv))
-	if err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		html  string
+		match map[string]string
+	}{
+		{`<div class="abcd />"`, map[string]string{matchNodeType: "div", "class": "abcd"}},
 	}
 
-	ret := findChildren(n, map[string]string{matchAtom: atom.Div.String(), atom.Class.String(): "b"})
-	t.Log(ret)
-	if len(ret) != 2 {
-		t.Error("Did not find the right items")
+	for _, test := range tests {
+		n, err := html.Parse(bytes.NewBufferString(test.html))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !matchNode(n, test.match) {
+			t.Errorf("failed %s", test.html)
+		}
 	}
+
 }

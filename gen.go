@@ -1,106 +1,124 @@
 // Copyright 2011 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
+// +build ignore
 
 // reads data from http://www.w3.org/TR/SVG/types.html and generates
 // golang.org/x/colornames/colornames.go
-
 package main
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"image/color"
 	"io"
+	"log"
 	"os"
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
 )
 
+type matchFunc func(*html.Node) bool
+
 //Find all nodes with the tag Atom under the children of the current node
-func findAll(n *html.Node, a atom.Atom) []*html.Node {
+func findAll(n *html.Node, mf matchFunc) []*html.Node {
 	ret := []*html.Node{}
 
-	if n.DataAtom == a {
+	if mf(n) {
 		ret = append(ret, n)
 	}
 	//travers all the children
 	for cur := n.FirstChild; cur != nil; cur = cur.NextSibling {
-		ret = append(ret, findAll(cur, a)...)
+		ret = append(ret, findAll(cur, mf)...)
 	}
 	return ret
 }
 
-func isMatch(n *html.Node, attrs []html.Attribute) bool {
-	numMatches := 0
+func extractSVGColors(n *html.Node) map[string]color.RGBA {
 
-OuterLoop:
-	for _, attr := range attrs {
-		for _, nattr := range n.Attr {
-			if nattr.Key == attr.Key && nattr.Namespace == attr.Namespace && nattr.Val == attr.Val {
-				numMatches++
-				break OuterLoop
+	ret := make(map[string]color.RGBA)
+
+	colortables := findAll(n, func(node *html.Node) bool {
+		if node.DataAtom != atom.Table {
+			return false
+		}
+		for _, attr := range node.Attr {
+			if attr.Key == "summary" && strings.Contains(attr.Val, "color keywords part") {
+				return true
 			}
 		}
-	}
-
-	if numMatches != len(attrs) {
 		return false
-	}
-	return true
-}
+	})
 
-func genAttr(m map[string]string) []html.Attribute {
-	ret := make([]html.Attribute, len(m))
-	ctr := 0
-	for k, v := range m {
-		ret[ctr] = html.Attribute{Namespace: "", Key: k, Val: v}
-		ctr++
-	}
-	return ret
-}
-
-func extractSVGColors(n *html.Node) map[string]color.Color {
-
-	ret := make(map[string]color.Color)
-
-	colortables := []*html.Node{}
-	matchers := [][]html.Attribute{
-		genAttr(map[string]string{"summary": "color keywords part 1"}),
-		genAttr(map[string]string{"summary": "color keywords part 2"}),
-	}
-
-	//there are several tables in the SVG Basic Data Type spec, find color keywords
-	for _, table := range findAll(n, atom.Table) {
-		for _, matcher := range matchers {
-			if isMatch(table, matcher) {
-				colortables = append(colortables, table)
-			}
-		}
-	}
-
-	re := regexp.MustCompile("[0-9]+")
+	re := regexp.MustCompile(`rgb\(\s*([0-9]+),\s*([0-9]+),\s*([0-9]+)\)`)
 	//within the color tables, the colors are stored in spans in rows
 	for _, table := range colortables {
-		for _, tr := range findAll(table, atom.Tr) {
-			spans := findAll(tr, atom.Span)
-			//the second color table has one fewer color
-			if len(spans) != 2 {
+		trs := findAll(table, func(node *html.Node) bool {
+			if node.DataAtom == atom.Tr {
+				return true
+			}
+			return false
+		})
+
+		//<span class="prop-value">aliceblue</span></td><td><span class="color-keyword-value">
+		for _, tr := range trs {
+			namespan := findAll(tr, func(node *html.Node) bool {
+				if node.DataAtom != atom.Span {
+					return false
+				}
+				for _, attr := range node.Attr {
+					if attr.Key == "class" && attr.Val == "prop-value" {
+						return true
+					}
+				}
+				return false
+			})
+
+			valuespan := findAll(tr, func(node *html.Node) bool {
+				if node.DataAtom != atom.Span {
+					return false
+				}
+				for _, attr := range node.Attr {
+					if attr.Key == "class" && attr.Val == "color-keyword-value" {
+						return true
+					}
+				}
+				return false
+			})
+
+			//there is a missing cell in one of the SVG tables. This skips it and does a sanity check on the childnode
+			if !(len(namespan) == 1 && len(valuespan) == 1 && namespan[0].FirstChild.Type == html.TextNode && valuespan[0].FirstChild.Type == html.TextNode) {
 				continue
 			}
-			colorname := spans[0].FirstChild.Data
-			colorvals := re.FindAllString(spans[1].FirstChild.Data, -1)
-			if len(colorvals) != 3 {
-				//should we panic instead? this should not happen
+
+			colorname := namespan[0].FirstChild.Data
+			colorvals := re.FindStringSubmatch(valuespan[0].FirstChild.Data)
+			if len(colorvals) != 4 {
+				log.Printf("Malformed color for %s:%v", colorname, valuespan[0].FirstChild.Data)
 				continue
 			}
-			r, _ := strconv.Atoi(colorvals[0])
-			g, _ := strconv.Atoi(colorvals[1])
-			b, _ := strconv.Atoi(colorvals[2])
+
+			var r, g, b uint64
+			var err error
+			if r, err = strconv.ParseUint(colorvals[1], 10, 8); err != nil {
+				log.Printf("Malformed R for %s:%v", colorname, valuespan[0].FirstChild.Data)
+				continue //should we log somewhere?
+			}
+			if g, err = strconv.ParseUint(colorvals[2], 10, 8); err != nil {
+				log.Printf("Malformed G for %s:%v", colorname, valuespan[0].FirstChild.Data)
+				continue //should we log somewhere?
+
+			}
+			if b, err = strconv.ParseUint(colorvals[3], 10, 8); err != nil {
+				log.Printf("Malformed B for %s:%v", colorname, valuespan[0].FirstChild.Data)
+				continue //should we log somewhere?
+			}
 			ret[colorname] = color.RGBA{uint8(r), uint8(g), uint8(b), 255}
 		}
 	}
@@ -117,7 +135,7 @@ import "image/color"
 
 `
 
-func getSortedKeys(m map[string]color.Color) []string {
+func getSortedKeys(m map[string]color.RGBA) []string {
 	ret := make([]string, len(m))
 	ctr := 0
 	for k := range m {
@@ -128,22 +146,20 @@ func getSortedKeys(m map[string]color.Color) []string {
 	return ret
 }
 
-func writeColornames(w io.Writer, m map[string]color.Color) {
-
+func writeColornames(w io.Writer, m map[string]color.RGBA) {
 	sortedkeys := getSortedKeys(m)
 	fmt.Fprintln(w, preamble)
 
 	fmt.Fprintln(w, "// Map contains named colors defined in SVG1.1 spec mapped to color.RGBA values")
 	fmt.Fprintln(w, "var Map = map[string]color.RGBA{")
 	for _, k := range sortedkeys {
-		r, g, b, a := m[k].RGBA()
-		fmt.Fprintf(w, "    \"%s\": color.RBGA{%d, %d, %d, %d},\n", k, r, g, b, a)
+		fmt.Fprintf(w, "    \"%s\": color.RGBA{%v, %v, %v, %v},\n", k, m[k].R, m[k].G, m[k].B, m[k].A)
 	}
 	fmt.Fprintln(w, "}")
 
 	fmt.Fprintln(w)
 
-	fmt.Fprintln(w, "// Names contains the color names defined in SVG1.1 spec")
+	fmt.Fprintln(w, "// Names contains the color names defined in SVG1.1 spec in alphabetical order")
 	fmt.Fprintln(w, "var Names = []string{")
 	for _, k := range sortedkeys {
 		fmt.Fprintf(w, "    \"%s\",\n", k)
@@ -152,16 +168,79 @@ func writeColornames(w io.Writer, m map[string]color.Color) {
 
 }
 
-func main() {
-	n, err := html.Parse(bytes.NewBufferString(testdata))
-	if err != nil {
-		panic(err)
-	}
-	colors := extractSVGColors(n)
-	writeColornames(os.Stdout, colors)
+var testset = map[string][]uint8{
+	"lightpink":      []uint8{255, 182, 193},
+	"aliceblue":      []uint8{240, 248, 255},
+	"crimson":        []uint8{220, 20, 60},
+	"mediumseagreen": []uint8{60, 179, 113},
+	"olivedrab":      []uint8{107, 142, 35},
+	"darkorange":     []uint8{255, 140, 0},
+	"deepskyblue":    []uint8{0, 191, 255},
+	"purple":         []uint8{128, 0, 128},
+	"greenyellow":    []uint8{173, 255, 47},
+	"slategrey":      []uint8{112, 128, 144},
+	"lightgrey":      []uint8{211, 211, 211},
+	"yellowgreen":    []uint8{154, 205, 50},
 }
 
-var testdata = `<!--
+func checkColors(m map[string]color.RGBA) bool {
+	if len(m) != 147 {
+		return false
+	}
+
+	for k, v := range testset {
+		col := m[k]
+		if !(col.R == v[0] && col.G == v[1] && col.B == v[2]) {
+			return false
+		}
+	}
+	return true
+
+}
+
+func main() {
+	var backup bool
+	flag.BoolVar(&backup, "backup", false, "build from the backup copy of the SVG specs rather than download fresh")
+	flag.Parse()
+
+	var tree *html.Node
+
+	if backup {
+		var err error
+		tree, err = html.Parse(bytes.NewBufferString(backupdata))
+		if err != nil {
+			log.Printf("Error parsing backup copy of the SVG specs - it may be corrupted:%s", err)
+			return
+		}
+	} else {
+		//try to read from the web
+		log.Println("Still need to implement read from web routine")
+		return
+	}
+
+	colors := extractSVGColors(tree)
+	if !checkColors(colors) {
+		log.Println("Error with Colors checking. Aborting")
+		return
+	}
+
+	buf := &bytes.Buffer{}
+	writeColornames(buf, colors)
+
+	fil, err := os.Create("colornames.go")
+	if err != nil {
+		log.Printf("Error with opening colornames.go for writing. Aborting:%s", err)
+		return
+	}
+	if _, err := fil.Write(buf.Bytes()); err != nil {
+		log.Printf("Error with writing colornames.go:%s", err)
+	}
+	fil.Close()
+}
+
+//accessed from http://www.w3.org/TR/SVG/types.html on 2015-08-04
+//usable as a backup for generation in case http client fails
+var backupdata = `<!--
   Scalable Vector Graphics (SVG) 1.1 (Second Edition)
   Chapter 4: Basic Data Types and Interfaces
 
@@ -725,12 +804,12 @@ floating point for intermediate calculations on certain numerical operations.</p
     can be used as a keyword value for data type <a href="types.html#DataTypeColor">&lt;color&gt;</a>:</p>
     <table class="color-keywords" summary="color keywords"><tr><td>
           <table summary="color keywords part 1"><tr><td><div class="colorpatch aliceblue"/></td><td><span class="prop-value">aliceblue</span></td><td><span class="color-keyword-value">rgb(240, 248, 255)</span></td></tr><tr><td><div class="colorpatch antiquewhite"/></td><td><span class="prop-value">antiquewhite</span></td><td><span class="color-keyword-value">rgb(250, 235, 215)</span></td></tr><tr><td><div class="colorpatch aqua"/></td><td><span class="prop-value">aqua</span></td><td><span class="color-keyword-value">rgb( 0, 255, 255)</span></td></tr><tr><td><div class="colorpatch aquamarine"/></td><td><span class="prop-value">aquamarine</span></td><td><span class="color-keyword-value">rgb(127, 255, 212)</span></td></tr><tr><td><div class="colorpatch azure"/></td><td><span class="prop-value">azure</span></td><td><span class="color-keyword-value">rgb(240, 255, 255)</span></td></tr><tr><td><div class="colorpatch beige"/></td><td><span class="prop-value">beige</span></td><td><span class="color-keyword-value">rgb(245, 245, 220)</span></td></tr><tr><td><div class="colorpatch bisque"/></td><td><span class="prop-value">bisque</span></td><td><span class="color-keyword-value">rgb(255, 228, 196)</span></td></tr><tr><td><div class="colorpatch black"/></td><td><span class="prop-value">black</span></td><td><span class="color-keyword-value">rgb( 0, 0, 0)</span></td></tr><tr><td><div class="colorpatch blanchedalmond"/></td><td><span class="prop-value">blanchedalmond</span></td><td><span class="color-keyword-value">rgb(255, 235, 205)</span></td></tr><tr><td><div class="colorpatch blue"/></td><td><span class="prop-value">blue</span></td><td><span class="color-keyword-value">rgb( 0, 0, 255)</span></td></tr><tr><td><div class="colorpatch blueviolet"/></td><td><span class="prop-value">blueviolet</span></td><td><span class="color-keyword-value">rgb(138, 43, 226)</span></td></tr><tr><td><div class="colorpatch brown"/></td><td><span class="prop-value">brown</span></td><td><span class="color-keyword-value">rgb(165, 42, 42)</span></td></tr><tr><td><div class="colorpatch burlywood"/></td><td><span class="prop-value">burlywood</span></td><td><span class="color-keyword-value">rgb(222, 184, 135)</span></td></tr><tr><td><div class="colorpatch cadetblue"/></td><td><span class="prop-value">cadetblue</span></td><td><span class="color-keyword-value">rgb( 95, 158, 160)</span></td></tr><tr><td><div class="colorpatch chartreuse"/></td><td><span class="prop-value">chartreuse</span></td><td><span class="color-keyword-value">rgb(127, 255, 0)</span></td></tr><tr><td><div class="colorpatch chocolate"/></td><td><span class="prop-value">chocolate</span></td><td><span class="color-keyword-value">rgb(210, 105, 30)</span></td></tr><tr><td><div class="colorpatch coral"/></td><td><span class="prop-value">coral</span></td><td><span class="color-keyword-value">rgb(255, 127, 80)</span></td></tr><tr><td><div class="colorpatch cornflowerblue"/></td><td><span class="prop-value">cornflowerblue</span></td><td><span class="color-keyword-value">rgb(100, 149, 237)</span></td></tr><tr><td><div class="colorpatch cornsilk"/></td><td><span class="prop-value">cornsilk</span></td><td><span class="color-keyword-value">rgb(255, 248, 220)</span></td></tr><tr><td><div class="colorpatch crimson"/></td><td><span class="prop-value">crimson</span></td><td><span class="color-keyword-value">rgb(220, 20, 60)</span></td></tr><tr><td><div class="colorpatch cyan"/></td><td><span class="prop-value">cyan</span></td><td><span class="color-keyword-value">rgb( 0, 255, 255)</span></td></tr><tr><td><div class="colorpatch darkblue"/></td><td><span class="prop-value">darkblue</span></td><td><span class="color-keyword-value">rgb( 0, 0, 139)</span></td></tr><tr><td><div class="colorpatch darkcyan"/></td><td><span class="prop-value">darkcyan</span></td><td><span class="color-keyword-value">rgb( 0, 139, 139)</span></td></tr><tr><td><div class="colorpatch darkgoldenrod"/></td><td><span class="prop-value">darkgoldenrod</span></td><td><span class="color-keyword-value">rgb(184, 134, 11)</span></td></tr><tr><td><div class="colorpatch darkgray"/></td><td><span class="prop-value">darkgray</span></td><td><span class="color-keyword-value">rgb(169, 169, 169)</span></td></tr><tr><td><div class="colorpatch darkgreen"/></td><td><span class="prop-value">darkgreen</span></td><td><span class="color-keyword-value">rgb( 0, 100, 0)</span></td></tr><tr><td><div class="colorpatch darkgrey"/></td><td><span class="prop-value">darkgrey</span></td><td><span class="color-keyword-value">rgb(169, 169, 169)</span></td></tr><tr><td><div class="colorpatch darkkhaki"/></td><td><span class="prop-value">darkkhaki</span></td><td><span class="color-keyword-value">rgb(189, 183, 107)</span></td></tr><tr><td><div class="colorpatch darkmagenta"/></td><td><span class="prop-value">darkmagenta</span></td><td><span class="color-keyword-value">rgb(139, 0, 139)</span></td></tr><tr><td><div class="colorpatch darkolivegreen"/></td><td><span class="prop-value">darkolivegreen</span></td><td><span class="color-keyword-value">rgb( 85, 107, 47)</span></td></tr><tr><td><div class="colorpatch darkorange"/></td><td><span class="prop-value">darkorange</span></td><td><span class="color-keyword-value">rgb(255, 140, 0)</span></td></tr><tr><td><div class="colorpatch darkorchid"/></td><td><span class="prop-value">darkorchid</span></td><td><span class="color-keyword-value">rgb(153, 50, 204)</span></td></tr><tr><td><div class="colorpatch darkred"/></td><td><span class="prop-value">darkred</span></td><td><span class="color-keyword-value">rgb(139, 0, 0)</span></td></tr><tr><td><div class="colorpatch darksalmon"/></td><td><span class="prop-value">darksalmon</span></td><td><span class="color-keyword-value">rgb(233, 150, 122)</span></td></tr><tr><td><div class="colorpatch darkseagreen"/></td><td><span class="prop-value">darkseagreen</span></td><td><span class="color-keyword-value">rgb(143, 188, 143)</span></td></tr><tr><td><div class="colorpatch darkslateblue"/></td><td><span class="prop-value">darkslateblue</span></td><td><span class="color-keyword-value">rgb( 72, 61, 139)</span></td></tr><tr><td><div class="colorpatch darkslategray"/></td><td><span class="prop-value">darkslategray</span></td><td><span class="color-keyword-value">rgb( 47, 79, 79)</span></td></tr><tr><td><div class="colorpatch darkslategrey"/></td><td><span class="prop-value">darkslategrey</span></td><td><span class="color-keyword-value">rgb( 47, 79, 79)</span></td></tr><tr><td><div class="colorpatch darkturquoise"/></td><td><span class="prop-value">darkturquoise</span></td><td><span class="color-keyword-value">rgb( 0, 206, 209)</span></td></tr><tr><td><div class="colorpatch darkviolet"/></td><td><span class="prop-value">darkviolet</span></td><td><span class="color-keyword-value">rgb(148, 0, 211)</span></td></tr><tr><td><div class="colorpatch deeppink"/></td><td><span class="prop-value">deeppink</span></td><td><span class="color-keyword-value">rgb(255, 20, 147)</span></td></tr><tr><td><div class="colorpatch deepskyblue"/></td><td><span class="prop-value">deepskyblue</span></td><td><span class="color-keyword-value">rgb( 0, 191, 255)</span></td></tr><tr><td><div class="colorpatch dimgray"/></td><td><span class="prop-value">dimgray</span></td><td><span class="color-keyword-value">rgb(105, 105, 105)</span></td></tr><tr><td><div class="colorpatch dimgrey"/></td><td><span class="prop-value">dimgrey</span></td><td><span class="color-keyword-value">rgb(105, 105, 105)</span></td></tr><tr><td><div class="colorpatch dodgerblue"/></td><td><span class="prop-value">dodgerblue</span></td><td><span class="color-keyword-value">rgb( 30, 144, 255)</span></td></tr><tr><td><div class="colorpatch firebrick"/></td><td><span class="prop-value">firebrick</span></td><td><span class="color-keyword-value">rgb(178, 34, 34)</span></td></tr><tr><td><div class="colorpatch floralwhite"/></td><td><span class="prop-value">floralwhite</span></td><td><span class="color-keyword-value">rgb(255, 250, 240)</span></td></tr><tr><td><div class="colorpatch forestgreen"/></td><td><span class="prop-value">forestgreen</span></td><td><span class="color-keyword-value">rgb( 34, 139, 34)</span></td></tr><tr><td><div class="colorpatch fuchsia"/></td><td><span class="prop-value">fuchsia</span></td><td><span class="color-keyword-value">rgb(255, 0, 255)</span></td></tr><tr><td><div class="colorpatch gainsboro"/></td><td><span class="prop-value">gainsboro</span></td><td><span class="color-keyword-value">rgb(220, 220, 220)</span></td></tr><tr><td><div class="colorpatch ghostwhite"/></td><td><span class="prop-value">ghostwhite</span></td><td><span class="color-keyword-value">rgb(248, 248, 255)</span></td></tr><tr><td><div class="colorpatch gold"/></td><td><span class="prop-value">gold</span></td><td><span class="color-keyword-value">rgb(255, 215, 0)</span></td></tr><tr><td><div class="colorpatch goldenrod"/></td><td><span class="prop-value">goldenrod</span></td><td><span class="color-keyword-value">rgb(218, 165, 32)</span></td></tr><tr><td><div class="colorpatch gray"/></td><td><span class="prop-value">gray</span></td><td><span class="color-keyword-value">rgb(128, 128, 128)</span></td></tr><tr><td><div class="colorpatch grey"/></td><td><span class="prop-value">grey</span></td><td><span class="color-keyword-value">rgb(128, 128, 128)</span></td></tr><tr><td><div class="colorpatch green"/></td><td><span class="prop-value">green</span></td><td><span class="color-keyword-value">rgb( 0, 128, 0)</span></td></tr><tr><td><div class="colorpatch greenyellow"/></td><td><span class="prop-value">greenyellow</span></td><td><span class="color-keyword-value">rgb(173, 255, 47)</span></td></tr><tr><td><div class="colorpatch honeydew"/></td><td><span class="prop-value">honeydew</span></td><td><span class="color-keyword-value">rgb(240, 255, 240)</span></td></tr><tr><td><div class="colorpatch hotpink"/></td><td><span class="prop-value">hotpink</span></td><td><span class="color-keyword-value">rgb(255, 105, 180)</span></td></tr><tr><td><div class="colorpatch indianred"/></td><td><span class="prop-value">indianred</span></td><td><span class="color-keyword-value">rgb(205, 92, 92)</span></td></tr><tr><td><div class="colorpatch indigo"/></td><td><span class="prop-value">indigo</span></td><td><span class="color-keyword-value">rgb( 75, 0, 130)</span></td></tr><tr><td><div class="colorpatch ivory"/></td><td><span class="prop-value">ivory</span></td><td><span class="color-keyword-value">rgb(255, 255, 240)</span></td></tr><tr><td><div class="colorpatch khaki"/></td><td><span class="prop-value">khaki</span></td><td><span class="color-keyword-value">rgb(240, 230, 140)</span></td></tr><tr><td><div class="colorpatch lavender"/></td><td><span class="prop-value">lavender</span></td><td><span class="color-keyword-value">rgb(230, 230, 250)</span></td></tr><tr><td><div class="colorpatch lavenderblush"/></td><td><span class="prop-value">lavenderblush</span></td><td><span class="color-keyword-value">rgb(255, 240, 245)</span></td></tr><tr><td><div class="colorpatch lawngreen"/></td><td><span class="prop-value">lawngreen</span></td><td><span class="color-keyword-value">rgb(124, 252, 0)</span></td></tr><tr><td><div class="colorpatch lemonchiffon"/></td><td><span class="prop-value">lemonchiffon</span></td><td><span class="color-keyword-value">rgb(255, 250, 205)</span></td></tr><tr><td><div class="colorpatch lightblue"/></td><td><span class="prop-value">lightblue</span></td><td><span class="color-keyword-value">rgb(173, 216, 230)</span></td></tr><tr><td><div class="colorpatch lightcoral"/></td><td><span class="prop-value">lightcoral</span></td><td><span class="color-keyword-value">rgb(240, 128, 128)</span></td></tr><tr><td><div class="colorpatch lightcyan"/></td><td><span class="prop-value">lightcyan</span></td><td><span class="color-keyword-value">rgb(224, 255, 255)</span></td></tr><tr><td><div class="colorpatch lightgoldenrodyellow"/></td><td><span class="prop-value">lightgoldenrodyellow</span></td><td><span class="color-keyword-value">rgb(250, 250, 210)</span></td></tr><tr><td><div class="colorpatch lightgray"/></td><td><span class="prop-value">lightgray</span></td><td><span class="color-keyword-value">rgb(211, 211, 211)</span></td></tr><tr><td><div class="colorpatch lightgreen"/></td><td><span class="prop-value">lightgreen</span></td><td><span class="color-keyword-value">rgb(144, 238, 144)</span></td></tr><tr><td><div class="colorpatch lightgrey"/></td><td><span class="prop-value">lightgrey</span></td><td><span class="color-keyword-value">rgb(211, 211, 211)</span></td></tr></table>
-        </td><td>    </td><td>
+        </td><td>    </td><td>
           <table summary="color keywords part 2"><tr><td><div class="colorpatch lightpink"/></td><td><span class="prop-value">lightpink</span></td><td><span class="color-keyword-value">rgb(255, 182, 193)</span></td></tr><tr><td><div class="colorpatch lightsalmon"/></td><td><span class="prop-value">lightsalmon</span></td><td><span class="color-keyword-value">rgb(255, 160, 122)</span></td></tr><tr><td><div class="colorpatch lightseagreen"/></td><td><span class="prop-value">lightseagreen</span></td><td><span class="color-keyword-value">rgb( 32, 178, 170)</span></td></tr><tr><td><div class="colorpatch lightskyblue"/></td><td><span class="prop-value">lightskyblue</span></td><td><span class="color-keyword-value">rgb(135, 206, 250)</span></td></tr><tr><td><div class="colorpatch lightslategray"/></td><td><span class="prop-value">lightslategray</span></td><td><span class="color-keyword-value">rgb(119, 136, 153)</span></td></tr><tr><td><div class="colorpatch lightslategrey"/></td><td><span class="prop-value">lightslategrey</span></td><td><span class="color-keyword-value">rgb(119, 136, 153)</span></td></tr><tr><td><div class="colorpatch lightsteelblue"/></td><td><span class="prop-value">lightsteelblue</span></td><td><span class="color-keyword-value">rgb(176, 196, 222)</span></td></tr><tr><td><div class="colorpatch lightyellow"/></td><td><span class="prop-value">lightyellow</span></td><td><span class="color-keyword-value">rgb(255, 255, 224)</span></td></tr><tr><td><div class="colorpatch lime"/></td><td><span class="prop-value">lime</span></td><td><span class="color-keyword-value">rgb( 0, 255, 0)</span></td></tr><tr><td><div class="colorpatch limegreen"/></td><td><span class="prop-value">limegreen</span></td><td><span class="color-keyword-value">rgb( 50, 205, 50)</span></td></tr><tr><td><div class="colorpatch linen"/></td><td><span class="prop-value">linen</span></td><td><span class="color-keyword-value">rgb(250, 240, 230)</span></td></tr><tr><td><div class="colorpatch magenta"/></td><td><span class="prop-value">magenta</span></td><td><span class="color-keyword-value">rgb(255, 0, 255)</span></td></tr><tr><td><div class="colorpatch maroon"/></td><td><span class="prop-value">maroon</span></td><td><span class="color-keyword-value">rgb(128, 0, 0)</span></td></tr><tr><td><div class="colorpatch mediumaquamarine"/></td><td><span class="prop-value">mediumaquamarine</span></td><td><span class="color-keyword-value">rgb(102, 205, 170)</span></td></tr><tr><td><div class="colorpatch mediumblue"/></td><td><span class="prop-value">mediumblue</span></td><td><span class="color-keyword-value">rgb( 0, 0, 205)</span></td></tr><tr><td><div class="colorpatch mediumorchid"/></td><td><span class="prop-value">mediumorchid</span></td><td><span class="color-keyword-value">rgb(186, 85, 211)</span></td></tr><tr><td><div class="colorpatch mediumpurple"/></td><td><span class="prop-value">mediumpurple</span></td><td><span class="color-keyword-value">rgb(147, 112, 219)</span></td></tr><tr><td><div class="colorpatch mediumseagreen"/></td><td><span class="prop-value">mediumseagreen</span></td><td><span class="color-keyword-value">rgb( 60, 179, 113)</span></td></tr><tr><td><div class="colorpatch mediumslateblue"/></td><td><span class="prop-value">mediumslateblue</span></td><td><span class="color-keyword-value">rgb(123, 104, 238)</span></td></tr><tr><td><div class="colorpatch mediumspringgreen"/></td><td><span class="prop-value">mediumspringgreen</span></td><td><span class="color-keyword-value">rgb( 0, 250, 154)</span></td></tr><tr><td><div class="colorpatch mediumturquoise"/></td><td><span class="prop-value">mediumturquoise</span></td><td><span class="color-keyword-value">rgb( 72, 209, 204)</span></td></tr><tr><td><div class="colorpatch mediumvioletred"/></td><td><span class="prop-value">mediumvioletred</span></td><td><span class="color-keyword-value">rgb(199, 21, 133)</span></td></tr><tr><td><div class="colorpatch midnightblue"/></td><td><span class="prop-value">midnightblue</span></td><td><span class="color-keyword-value">rgb( 25, 25, 112)</span></td></tr><tr><td><div class="colorpatch mintcream"/></td><td><span class="prop-value">mintcream</span></td><td><span class="color-keyword-value">rgb(245, 255, 250)</span></td></tr><tr><td><div class="colorpatch mistyrose"/></td><td><span class="prop-value">mistyrose</span></td><td><span class="color-keyword-value">rgb(255, 228, 225)</span></td></tr><tr><td><div class="colorpatch moccasin"/></td><td><span class="prop-value">moccasin</span></td><td><span class="color-keyword-value">rgb(255, 228, 181)</span></td></tr><tr><td><div class="colorpatch navajowhite"/></td><td><span class="prop-value">navajowhite</span></td><td><span class="color-keyword-value">rgb(255, 222, 173)</span></td></tr><tr><td><div class="colorpatch navy"/></td><td><span class="prop-value">navy</span></td><td><span class="color-keyword-value">rgb( 0, 0, 128)</span></td></tr><tr><td><div class="colorpatch oldlace"/></td><td><span class="prop-value">oldlace</span></td><td><span class="color-keyword-value">rgb(253, 245, 230)</span></td></tr><tr><td><div class="colorpatch olive"/></td><td><span class="prop-value">olive</span></td><td><span class="color-keyword-value">rgb(128, 128, 0)</span></td></tr><tr><td><div class="colorpatch olivedrab"/></td><td><span class="prop-value">olivedrab</span></td><td><span class="color-keyword-value">rgb(107, 142, 35)</span></td></tr><tr><td><div class="colorpatch orange"/></td><td><span class="prop-value">orange</span></td><td><span class="color-keyword-value">rgb(255, 165, 0)</span></td></tr><tr><td><div class="colorpatch orangered"/></td><td><span class="prop-value">orangered</span></td><td><span class="color-keyword-value">rgb(255, 69, 0)</span></td></tr><tr><td><div class="colorpatch orchid"/></td><td><span class="prop-value">orchid</span></td><td><span class="color-keyword-value">rgb(218, 112, 214)</span></td></tr><tr><td><div class="colorpatch palegoldenrod"/></td><td><span class="prop-value">palegoldenrod</span></td><td><span class="color-keyword-value">rgb(238, 232, 170)</span></td></tr><tr><td><div class="colorpatch palegreen"/></td><td><span class="prop-value">palegreen</span></td><td><span class="color-keyword-value">rgb(152, 251, 152)</span></td></tr><tr><td><div class="colorpatch paleturquoise"/></td><td><span class="prop-value">paleturquoise</span></td><td><span class="color-keyword-value">rgb(175, 238, 238)</span></td></tr><tr><td><div class="colorpatch palevioletred"/></td><td><span class="prop-value">palevioletred</span></td><td><span class="color-keyword-value">rgb(219, 112, 147)</span></td></tr><tr><td><div class="colorpatch papayawhip"/></td><td><span class="prop-value">papayawhip</span></td><td><span class="color-keyword-value">rgb(255, 239, 213)</span></td></tr><tr><td><div class="colorpatch peachpuff"/></td><td><span class="prop-value">peachpuff</span></td><td><span class="color-keyword-value">rgb(255, 218, 185)</span></td></tr><tr><td><div class="colorpatch peru"/></td><td><span class="prop-value">peru</span></td><td><span class="color-keyword-value">rgb(205, 133, 63)</span></td></tr><tr><td><div class="colorpatch pink"/></td><td><span class="prop-value">pink</span></td><td><span class="color-keyword-value">rgb(255, 192, 203)</span></td></tr><tr><td><div class="colorpatch plum"/></td><td><span class="prop-value">plum</span></td><td><span class="color-keyword-value">rgb(221, 160, 221)</span></td></tr><tr><td><div class="colorpatch powderblue"/></td><td><span class="prop-value">powderblue</span></td><td><span class="color-keyword-value">rgb(176, 224, 230)</span></td></tr><tr><td><div class="colorpatch purple"/></td><td><span class="prop-value">purple</span></td><td><span class="color-keyword-value">rgb(128, 0, 128)</span></td></tr><tr><td><div class="colorpatch red"/></td><td><span class="prop-value">red</span></td><td><span class="color-keyword-value">rgb(255, 0, 0)</span></td></tr><tr><td><div class="colorpatch rosybrown"/></td><td><span class="prop-value">rosybrown</span></td><td><span class="color-keyword-value">rgb(188, 143, 143)</span></td></tr><tr><td><div class="colorpatch royalblue"/></td><td><span class="prop-value">royalblue</span></td><td><span class="color-keyword-value">rgb( 65, 105, 225)</span></td></tr><tr><td><div class="colorpatch saddlebrown"/></td><td><span class="prop-value">saddlebrown</span></td><td><span class="color-keyword-value">rgb(139, 69, 19)</span></td></tr><tr><td><div class="colorpatch salmon"/></td><td><span class="prop-value">salmon</span></td><td><span class="color-keyword-value">rgb(250, 128, 114)</span></td></tr><tr><td><div class="colorpatch sandybrown"/></td><td><span class="prop-value">sandybrown</span></td><td><span class="color-keyword-value">rgb(244, 164, 96)</span></td></tr><tr><td><div class="colorpatch seagreen"/></td><td><span class="prop-value">seagreen</span></td><td><span class="color-keyword-value">rgb( 46, 139, 87)</span></td></tr><tr><td><div class="colorpatch seashell"/></td><td><span class="prop-value">seashell</span></td><td><span class="color-keyword-value">rgb(255, 245, 238)</span></td></tr><tr><td><div class="colorpatch sienna"/></td><td><span class="prop-value">sienna</span></td><td><span class="color-keyword-value">rgb(160, 82, 45)</span></td></tr><tr><td><div class="colorpatch silver"/></td><td><span class="prop-value">silver</span></td><td><span class="color-keyword-value">rgb(192, 192, 192)</span></td></tr><tr><td><div class="colorpatch skyblue"/></td><td><span class="prop-value">skyblue</span></td><td><span class="color-keyword-value">rgb(135, 206, 235)</span></td></tr><tr><td><div class="colorpatch slateblue"/></td><td><span class="prop-value">slateblue</span></td><td><span class="color-keyword-value">rgb(106, 90, 205)</span></td></tr><tr><td><div class="colorpatch slategray"/></td><td><span class="prop-value">slategray</span></td><td><span class="color-keyword-value">rgb(112, 128, 144)</span></td></tr><tr><td><div class="colorpatch slategrey"/></td><td><span class="prop-value">slategrey</span></td><td><span class="color-keyword-value">rgb(112, 128, 144)</span></td></tr><tr><td><div class="colorpatch snow"/></td><td><span class="prop-value">snow</span></td><td><span class="color-keyword-value">rgb(255, 250, 250)</span></td></tr><tr><td><div class="colorpatch springgreen"/></td><td><span class="prop-value">springgreen</span></td><td><span class="color-keyword-value">rgb( 0, 255, 127)</span></td></tr><tr><td><div class="colorpatch steelblue"/></td><td><span class="prop-value">steelblue</span></td><td><span class="color-keyword-value">rgb( 70, 130, 180)</span></td></tr><tr><td><div class="colorpatch tan"/>
               </td><td><span class="prop-value">tan</span></td><td><span class="color-keyword-value">rgb(210, 180, 140)</span></td></tr><tr><td><div class="colorpatch teal"/></td><td><span class="prop-value">teal</span></td><td><span class="color-keyword-value">rgb( 0, 128, 128)</span></td></tr><tr><td><div class="colorpatch thistle"/></td><td><span class="prop-value">thistle</span></td><td><span class="color-keyword-value">rgb(216, 191, 216)</span></td></tr><tr><td><div class="colorpatch tomato"/></td><td><span class="prop-value">tomato</span></td><td><span class="color-keyword-value">rgb(255, 99, 71)</span></td></tr><tr><td><div class="colorpatch turquoise"/></td><td><span class="prop-value">turquoise</span></td><td><span class="color-keyword-value">rgb( 64, 224, 208)</span></td></tr><tr><td><div class="colorpatch violet"/></td><td><span class="prop-value">violet</span></td><td><span class="color-keyword-value">rgb(238, 130, 238)</span></td></tr><tr><td><div class="colorpatch wheat"/></td><td><span class="prop-value">wheat</span></td><td><span class="color-keyword-value">rgb(245, 222, 179)</span></td></tr><tr><td><div class="colorpatch white"/></td><td><span class="prop-value">white</span></td><td><span class="color-keyword-value">rgb(255, 255, 255)</span></td></tr><tr><td><div class="colorpatch whitesmoke"/>
               </td><td><span class="prop-value">whitesmoke</span></td><td><span class="color-keyword-value">rgb(245, 245, 245)</span></td></tr><tr><td><div class="colorpatch yellow"/>
               </td><td><span class="prop-value">yellow</span></td><td><span class="color-keyword-value">rgb(255, 255, 0)</span></td></tr><tr><td><div class="colorpatch yellowgreen"/>
-              </td><td><span class="prop-value">yellowgreen</span></td><td><span class="color-keyword-value">rgb(154, 205, 50)</span></td></tr><tr><td/><td><span class="prop-value"> </span></td><td> </td></tr></table>
+              </td><td><span class="prop-value">yellowgreen</span></td><td><span class="color-keyword-value">rgb(154, 205, 50)</span></td></tr><tr><td/><td><span class="prop-value"> </span></td><td> </td></tr></table>
         </td></tr></table>
 
 <h2 id="BasicDOMInterfaces">4.5 Basic DOM interfaces</h2>
@@ -2149,5 +2228,4 @@ floating point for intermediate calculations on certain numerical operations.</p
 
 </div></dd></dl></dd></dl>
 
-<div class="header bottom"><span class="namedate">SVG 1.1 (Second Edition) – 16 August 2011</span><a href="Overview.html">Top</a> ⋅ <a href="expanded-toc.html">Contents</a> ⋅ <a href="render.html">Previous</a> ⋅ <a href="struct.html">Next</a> ⋅ <a href="eltindex.html">Elements</a> ⋅ <a href="attindex.html">Attributes</a> ⋅ <a href="propidx.html">Properties</a></div><script src="style/expanders.js" type="text/javascript"> </script></body></html>
-`
+<div class="header bottom"><span class="namedate">SVG 1.1 (Second Edition) – 16 August 2011</span><a href="Overview.html">Top</a> ⋅ <a href="expanded-toc.html">Contents</a> ⋅ <a href="render.html">Previous</a> ⋅ <a href="struct.html">Next</a> ⋅ <a href="eltindex.html">Elements</a> ⋅ <a href="attindex.html">Attributes</a> ⋅ <a href="propidx.html">Properties</a></div><script src="style/expanders.js" type="text/javascript"> </script></body></html>`
